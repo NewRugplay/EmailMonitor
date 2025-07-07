@@ -157,7 +157,7 @@ def HEALTHSERVER_CONSOLE_DISCONNECT():
 
 def HEALTHSERVER_RUN():
     PORT = int(os.environ.get("PORT", 5000))
-    HEALTHSERVER_CONSOLE_SOCKETIO.run(HEALTHSERVER_APP, host="0.0.0.0", port=PORT, debug=False)
+    HEALTHSERVER_CONSOLE_SOCKETIO.run(HEALTHSERVER_APP, host="0.0.0.0", port=PORT, debug=False, allow_unsafe_werkzeug=True)
 
 HEALTHSERVER_THREAD = threading.Thread(target=HEALTHSERVER_RUN)
 HEALTHSERVER_THREAD.daemon = True
