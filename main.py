@@ -170,10 +170,86 @@ class EmailMonitor:
         
         return embed
 
-    def check_folder(self, mail: imaplib.IMAP4_SSL, folder: str, email_type: str) -> None:
-        """Check a specific folder for new emails."""
+    def get_available_folders(self, mail: imaplib.IMAP4_SSL) -> List[str]:
+        """Get list of available folders from the server."""
         try:
-            mail.select(folder)
+            status, folders = mail.list()
+            if status != 'OK':
+                return []
+            
+            folder_names = []
+            for folder in folders:
+                # Parse folder name from the list response
+                folder_info = folder.decode('utf-8')
+                logger.debug(f"Raw folder info: {folder_info}")
+                
+                # Try different parsing methods
+                if '"' in folder_info:
+                    # Method 1: Extract text between last set of quotes
+                    parts = folder_info.split('"')
+                    if len(parts) >= 4:
+                        folder_name = parts[-2]
+                    else:
+                        folder_name = parts[-1] if parts else folder_info
+                else:
+                    # Method 2: Take the last part after space
+                    parts = folder_info.split()
+                    if len(parts) >= 3:
+                        folder_name = parts[-1]
+                    else:
+                        folder_name = folder_info
+                
+                # Clean up folder name
+                folder_name = folder_name.strip()
+                if folder_name and folder_name != '.':
+                    folder_names.append(folder_name)
+            
+            return folder_names
+        except Exception as e:
+            logger.error(f"Error getting folder list: {e}")
+            return []
+
+    def find_sent_folder(self, mail: imaplib.IMAP4_SSL) -> Optional[str]:
+        """Find the sent folder by trying to select common names."""
+        possible_sent_folders = [
+            'Sent',
+            'INBOX.Sent', 
+            'INBOX/Sent',
+            'Sent Items',
+            'Sent Messages',
+            'INBOX.Sent Items',
+            'INBOX.Sent Messages',
+            'Gesendete Elemente',  # German
+            'Elementos enviados',  # Spanish
+            'Enviados',  # Spanish/Portuguese
+            'Verzonden',  # Dutch
+            'Skickat',  # Swedish
+        ]
+        
+        for folder in possible_sent_folders:
+            try:
+                logger.info(f"Trying to select folder: {folder}")
+                status, count = mail.select(folder, readonly=True)
+                if status == 'OK':
+                    logger.info(f"Successfully found sent folder: {folder}")
+                    return folder
+                else:
+                    logger.debug(f"Could not select {folder}: {status}")
+            except Exception as e:
+                logger.debug(f"Error trying folder {folder}: {e}")
+        
+        return None
+
+    def check_folder(self, mail: imaplib.IMAP4_SSL, folder: str, email_type: str) -> bool:
+        """Check a specific folder for new emails. Returns True if successful."""
+        try:
+            # Try to select the folder
+            status, count = mail.select(folder)
+            if status != 'OK':
+                logger.warning(f"Could not select folder '{folder}': {status}")
+                return False
+            
+            logger.info(f"Successfully selected folder '{folder}' with {count[0].decode()} messages")
             
             # Search for emails based on type
             if email_type == "received":
@@ -186,15 +262,20 @@ class EmailMonitor:
             status, messages = mail.search(None, search_criteria)
             
             if status != 'OK':
-                logger.error(f"Failed to search {folder}")
-                return
+                logger.error(f"Failed to search {folder}: {status}")
+                return False
             
             email_ids = messages[0].split()
+            logger.info(f"Found {len(email_ids)} emails in {folder} (type: {email_type})")
             
             for email_id in email_ids:
                 # Skip if already processed
-                if email_id in self.processed_uids[folder]:
+                if email_id in self.processed_uids.get(folder, set()):
                     continue
+                
+                # Initialize folder in processed_uids if not exists
+                if folder not in self.processed_uids:
+                    self.processed_uids[folder] = set()
                 
                 # Fetch email
                 status, msg_data = mail.fetch(email_id, '(RFC822)')
@@ -243,38 +324,62 @@ class EmailMonitor:
                 
                 # Mark as processed
                 self.processed_uids[folder].add(email_id)
-                
+            
+            return True
+            
         except Exception as e:
             logger.error(f"Error checking {folder}: {e}")
+            return False
 
     def monitor_emails(self) -> None:
         """Main monitoring loop."""
         logger.info("Starting email monitor...")
+        
+        # Get available folders on first run
+        first_run = True
+        sent_folder = None
         
         while True:
             try:
                 # Connect to IMAP server
                 mail = self.connect_imap()
                 
+                # On first run, discover available folders
+                if first_run:
+                    logger.info("Discovering available folders...")
+                    available_folders = self.get_available_folders(mail)
+                    logger.info(f"Available folders: {available_folders}")
+                    
+                    # Find the sent folder by trying to select them
+                    logger.info("Searching for sent folder...")
+                    sent_folder = self.find_sent_folder(mail)
+                    
+                    if sent_folder:
+                        logger.info(f"Found sent folder: {sent_folder}")
+                    else:
+                        logger.warning("No sent folder found, will only monitor inbox")
+                    
+                    first_run = False
+                
                 # Check inbox for new unread emails
+                logger.info("Checking INBOX for new emails...")
                 self.check_folder(mail, 'INBOX', 'received')
                 
-                # Check sent folder for new sent emails
-                # Try common sent folder names for Hostinger
-                sent_folders = ['Sent', 'INBOX.Sent', 'INBOX/Sent', 'Sent Items', 'Sent Messages']
+                # Check sent folder for new sent emails (if found)
+                if sent_folder:
+                    logger.info(f"Checking {sent_folder} for new sent emails...")
+                    self.check_folder(mail, sent_folder, 'sent')
                 
-                for sent_folder in sent_folders:
-                    try:
-                        self.check_folder(mail, sent_folder, 'sent')
-                        break  # If successful, don't try other folder names
-                    except:
-                        continue
+                # Close connection properly
+                try:
+                    mail.close()
+                except:
+                    pass  # Ignore errors when closing
                 
-                # Close connection
-                mail.close()
                 mail.logout()
                 
                 # Wait before next check
+                logger.info(f"Waiting {self.check_interval} seconds before next check...")
                 time.sleep(self.check_interval)
                 
             except KeyboardInterrupt:
@@ -282,6 +387,12 @@ class EmailMonitor:
                 break
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}")
+                # Try to close connection if still open
+                try:
+                    mail.close()
+                    mail.logout()
+                except:
+                    pass
                 time.sleep(self.check_interval)
 
 def main():
